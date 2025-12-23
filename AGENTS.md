@@ -1,0 +1,1 @@
+Run `cargo check` on each turn so that you know it still builds.
