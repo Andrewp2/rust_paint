@@ -772,7 +772,15 @@ impl eframe::App for PaintApp {
                         render_line(&painter, start, end, self.brush_size, self.current_color())
                     }
                     Tool::Rectangle => {
-                        render_rect(&painter, start, end, self.brush_size, self.current_color())
+                        render_rect_aligned(
+                            &painter,
+                            start,
+                            end,
+                            self.brush_size,
+                            self.current_color(),
+                            self.canvas.origin,
+                            self.canvas.scale,
+                        )
                     }
                     Tool::Table => render_table(
                         &painter,
@@ -960,6 +968,10 @@ fn canvas_pixel_size(size: egui::Vec2, scale: f32) -> (u32, u32) {
 
 fn canvas_to_image(pos: egui::Pos2, origin: egui::Pos2, scale: f32) -> egui::Pos2 {
     egui::pos2((pos.x - origin.x) * scale, (pos.y - origin.y) * scale)
+}
+
+fn image_to_canvas(pos: egui::Pos2, origin: egui::Pos2, scale: f32) -> egui::Pos2 {
+    egui::pos2(pos.x / scale + origin.x, pos.y / scale + origin.y)
 }
 
 fn color_to_array(color: egui::Color32) -> [u8; 4] {
@@ -1273,17 +1285,34 @@ fn render_line(
     color: egui::Color32,
 ) {
     painter.line_segment([start, end], egui::Stroke::new(width, color));
+    let radius = width / 2.0;
+    painter.circle_filled(start, radius, color);
+    painter.circle_filled(end, radius, color);
 }
 
-fn render_rect(
+fn render_rect_aligned(
     painter: &egui::Painter,
     start: egui::Pos2,
     end: egui::Pos2,
     width: f32,
     color: egui::Color32,
+    origin: egui::Pos2,
+    scale: f32,
 ) {
-    let rect = egui::Rect::from_two_pos(start, end);
-    painter.rect_stroke(rect, 0.0, egui::Stroke::new(width, color));
+    let start_img = canvas_to_image(start, origin, scale);
+    let end_img = canvas_to_image(end, origin, scale);
+    let min_x = start_img.x.min(end_img.x).floor();
+    let max_x = start_img.x.max(end_img.x).ceil();
+    let min_y = start_img.y.min(end_img.y).floor();
+    let max_y = start_img.y.max(end_img.y).ceil();
+    let min_canvas = image_to_canvas(egui::pos2(min_x, min_y), origin, scale);
+    let max_canvas = image_to_canvas(egui::pos2(max_x, max_y), origin, scale);
+    let thickness_px = (width * scale).round().max(1.0);
+    let stroke_width = thickness_px / scale;
+    let inset = stroke_width / 2.0;
+    let rect = egui::Rect::from_two_pos(min_canvas, max_canvas)
+        .shrink2(egui::vec2(inset, inset));
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(stroke_width, color));
 }
 
 fn render_table(
