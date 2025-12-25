@@ -24,6 +24,9 @@ struct PaintApp {
     text_caret: usize,
     text_selection: Option<usize>,
     next_layer_id: u32,
+    tool_icons: Option<ToolIcons>,
+    resize_active: bool,
+    resize_start: Option<(egui::Pos2, u32, u32)>,
 }
 
 struct TextPreview {
@@ -86,6 +89,17 @@ struct Tile {
     texture: Option<egui::TextureHandle>,
     dirty: bool,
     name: String,
+}
+
+struct ToolIcons {
+    brush: egui::TextureHandle,
+    eraser: egui::TextureHandle,
+    line: egui::TextureHandle,
+    rectangle: egui::TextureHandle,
+    table: egui::TextureHandle,
+    ellipse: egui::TextureHandle,
+    bucket: egui::TextureHandle,
+    text: egui::TextureHandle,
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +172,9 @@ impl PaintApp {
             text_caret: 0,
             text_selection: None,
             next_layer_id: 2,
+            tool_icons: None,
+            resize_active: false,
+            resize_start: None,
         }
     }
 
@@ -232,6 +249,22 @@ impl Canvas {
         self.tiles = tiles;
         self.tiles_per_row = tiles_per_row;
         self.view_offset = egui::Vec2::ZERO;
+        self.clamp_view_offset();
+        self.mark_composite_dirty_all();
+    }
+
+    fn resize_images(&mut self, width: u32, height: u32) {
+        for layer in &mut self.layers {
+            let mut new_image = image::RgbaImage::new(width, height);
+            let transparent = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0);
+            fill_image(&mut new_image, transparent);
+            copy_image_region(&layer.image, &mut new_image);
+            layer.image = new_image;
+        }
+        self.composite = image::RgbaImage::new(width, height);
+        let (tiles, tiles_per_row) = build_tiles(width, height);
+        self.tiles = tiles;
+        self.tiles_per_row = tiles_per_row;
         self.clamp_view_offset();
         self.mark_composite_dirty_all();
     }
@@ -402,6 +435,25 @@ impl eframe::App for PaintApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(2.0);
         let pixels_per_point = ctx.pixels_per_point();
+        if self.tool_icons.is_none() {
+            self.tool_icons = Some(ToolIcons::load(ctx));
+        }
+        let (brush_icon, eraser_icon, line_icon, rect_icon, table_icon, ellipse_icon, bucket_icon, text_icon) = {
+            let tool_icons = self
+                .tool_icons
+                .as_ref()
+                .expect("tool icons should be loaded");
+            (
+                tool_icons.brush.clone(),
+                tool_icons.eraser.clone(),
+                tool_icons.line.clone(),
+                tool_icons.rectangle.clone(),
+                tool_icons.table.clone(),
+                tool_icons.ellipse.clone(),
+                tool_icons.bucket.clone(),
+                tool_icons.text.clone(),
+            )
+        };
 
         let mut commit_text = false;
         let mut cancel_text = false;
@@ -533,14 +585,20 @@ impl eframe::App for PaintApp {
                 ui.separator();
 
                 ui.label("Tool");
-                ui.radio_value(&mut self.tool, Tool::Brush, "Brush");
-                ui.radio_value(&mut self.tool, Tool::Eraser, "Eraser");
-                ui.radio_value(&mut self.tool, Tool::Line, "Line");
-                ui.radio_value(&mut self.tool, Tool::Rectangle, "Rectangle");
-                ui.radio_value(&mut self.tool, Tool::Table, "Table");
-                ui.radio_value(&mut self.tool, Tool::Ellipse, "Ellipse");
-                ui.radio_value(&mut self.tool, Tool::Bucket, "Bucket");
-                ui.radio_value(&mut self.tool, Tool::Text, "Text");
+                tool_radio(ui, &mut self.tool, Tool::Brush, "Brush", &brush_icon);
+                tool_radio(ui, &mut self.tool, Tool::Eraser, "Eraser", &eraser_icon);
+                tool_radio(ui, &mut self.tool, Tool::Line, "Line", &line_icon);
+                tool_radio(
+                    ui,
+                    &mut self.tool,
+                    Tool::Rectangle,
+                    "Rectangle",
+                    &rect_icon,
+                );
+                tool_radio(ui, &mut self.tool, Tool::Table, "Table", &table_icon);
+                tool_radio(ui, &mut self.tool, Tool::Ellipse, "Ellipse", &ellipse_icon);
+                tool_radio(ui, &mut self.tool, Tool::Bucket, "Bucket", &bucket_icon);
+                tool_radio(ui, &mut self.tool, Tool::Text, "Text", &text_icon);
 
                 ui.add_space(8.0);
                 ui.label("Color");
@@ -751,6 +809,20 @@ impl eframe::App for PaintApp {
                 }
             }
 
+            let handle_size = 14.0;
+            let handle_min = image_to_canvas(
+                egui::pos2(
+                    self.canvas.composite.width() as f32,
+                    self.canvas.composite.height() as f32,
+                ),
+                self.canvas.origin,
+                self.canvas.scale,
+            ) - egui::vec2(handle_size, handle_size);
+            let handle_rect = egui::Rect::from_min_size(
+                handle_min,
+                egui::vec2(handle_size, handle_size),
+            );
+
             self.canvas.ensure_composite(self.background);
             self.canvas.ensure_tiles(ctx);
             for tile in &self.canvas.tiles {
@@ -807,6 +879,17 @@ impl eframe::App for PaintApp {
             if response.drag_started() {
                 if let Some(pos) = response.interact_pointer_pos() {
                     if rect.contains(pos) {
+                        if handle_rect.contains(pos) {
+                            self.resize_active = true;
+                            self.resize_start = Some((
+                                pos,
+                                self.canvas.composite.width(),
+                                self.canvas.composite.height(),
+                            ));
+                            self.drag_start = None;
+                            self.drag_current = None;
+                            self.last_draw_pos = None;
+                        } else {
                         self.drag_start = Some(pos);
                         self.drag_current = Some(pos);
                         if matches!(
@@ -901,6 +984,7 @@ impl eframe::App for PaintApp {
                                 }
                             }
                         }
+                        }
                     }
                 }
             }
@@ -908,39 +992,60 @@ impl eframe::App for PaintApp {
             if response.dragged() {
                 if let Some(pos) = response.interact_pointer_pos() {
                     if rect.contains(pos) {
-                        self.drag_current = Some(pos);
-                        if matches!(self.tool, Tool::Brush | Tool::Eraser) {
-                            let scale = self.canvas.scale;
-                            let origin = self.canvas.origin;
-                            let color = image::Rgba(color_to_array(self.current_color()));
-                            let canvas_pos = canvas_to_image(pos, origin, scale);
-                            if let Some(prev) = self.last_draw_pos {
-                                if let Some(layer) = self.canvas.active_layer_mut() {
-                                    draw_brush_segment(
-                                        &mut layer.image,
-                                        prev,
-                                        canvas_pos,
-                                        (self.brush_size / 2.0).max(1.0) * scale,
-                                        color,
-                                    );
-                                    let radius = (self.brush_size / 2.0).max(1.0) * scale;
-                                    let min_x = prev.x.min(canvas_pos.x) - radius;
-                                    let min_y = prev.y.min(canvas_pos.y) - radius;
-                                    let max_x = prev.x.max(canvas_pos.x) + radius;
-                                    let max_y = prev.y.max(canvas_pos.y) + radius;
-                                    self.canvas.mark_dirty_rect(
-                                        egui::pos2(min_x, min_y),
-                                        egui::pos2(max_x, max_y),
-                                    );
+                        if self.resize_active {
+                            if let Some((start_pos, start_w, start_h)) = self.resize_start {
+                                let delta = pos - start_pos;
+                                let new_w =
+                                    (start_w as f32 + delta.x * self.canvas.scale).round() as i32;
+                                let new_h =
+                                    (start_h as f32 + delta.y * self.canvas.scale).round() as i32;
+                                let clamped_w = new_w.max(64) as u32;
+                                let clamped_h = new_h.max(64) as u32;
+                                if clamped_w != self.canvas.composite.width()
+                                    || clamped_h != self.canvas.composite.height()
+                                {
+                                    self.canvas.resize_images(clamped_w, clamped_h);
                                 }
                             }
-                            self.last_draw_pos = Some(canvas_pos);
+                        } else {
+                            self.drag_current = Some(pos);
+                            if matches!(self.tool, Tool::Brush | Tool::Eraser) {
+                                let scale = self.canvas.scale;
+                                let origin = self.canvas.origin;
+                                let color = image::Rgba(color_to_array(self.current_color()));
+                                let canvas_pos = canvas_to_image(pos, origin, scale);
+                                if let Some(prev) = self.last_draw_pos {
+                                    if let Some(layer) = self.canvas.active_layer_mut() {
+                                        draw_brush_segment(
+                                            &mut layer.image,
+                                            prev,
+                                            canvas_pos,
+                                            (self.brush_size / 2.0).max(1.0) * scale,
+                                            color,
+                                        );
+                                        let radius = (self.brush_size / 2.0).max(1.0) * scale;
+                                        let min_x = prev.x.min(canvas_pos.x) - radius;
+                                        let min_y = prev.y.min(canvas_pos.y) - radius;
+                                        let max_x = prev.x.max(canvas_pos.x) + radius;
+                                        let max_y = prev.y.max(canvas_pos.y) + radius;
+                                        self.canvas.mark_dirty_rect(
+                                            egui::pos2(min_x, min_y),
+                                            egui::pos2(max_x, max_y),
+                                        );
+                                    }
+                                }
+                                self.last_draw_pos = Some(canvas_pos);
+                            }
                         }
                     }
                 }
             }
 
             if response.drag_stopped() {
+                if self.resize_active {
+                    self.resize_active = false;
+                    self.resize_start = None;
+                }
                 if let (Some(start), Some(end)) = (self.drag_start, self.drag_current) {
                     let origin = self.canvas.origin;
                     let scale = self.canvas.scale;
@@ -1224,7 +1329,35 @@ impl eframe::App for PaintApp {
                     );
                 }
             }
+
+            painter.rect_filled(
+                handle_rect,
+                2.0,
+                egui::Color32::from_gray(220),
+            );
+            painter.line_segment(
+                [
+                    handle_rect.left_bottom(),
+                    handle_rect.right_top(),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+            );
         });
+    }
+}
+
+impl ToolIcons {
+    fn load(ctx: &egui::Context) -> Self {
+        Self {
+            brush: load_svg_icon(ctx, "brush", include_bytes!("../assets/icons/brush.svg")),
+            eraser: load_svg_icon(ctx, "eraser", include_bytes!("../assets/icons/eraser.svg")),
+            line: load_svg_icon(ctx, "line", include_bytes!("../assets/icons/line.svg")),
+            rectangle: load_svg_icon(ctx, "rectangle", include_bytes!("../assets/icons/rectangle.svg")),
+            table: load_svg_icon(ctx, "table", include_bytes!("../assets/icons/table.svg")),
+            ellipse: load_svg_icon(ctx, "ellipse", include_bytes!("../assets/icons/ellipse.svg")),
+            bucket: load_svg_icon(ctx, "bucket", include_bytes!("../assets/icons/bucket.svg")),
+            text: load_svg_icon(ctx, "text", include_bytes!("../assets/icons/text.svg")),
+        }
     }
 }
 
@@ -1245,6 +1378,50 @@ fn canvas_pixel_size(size: egui::Vec2, scale: f32) -> (u32, u32) {
     let width = (size.x * scale).max(1.0).round() as u32;
     let height = (size.y * scale).max(1.0).round() as u32;
     (width, height)
+}
+
+fn tool_radio(
+    ui: &mut egui::Ui,
+    tool: &mut Tool,
+    value: Tool,
+    label: &str,
+    icon: &egui::TextureHandle,
+) {
+    let size = egui::vec2(18.0, 18.0);
+    ui.horizontal(|ui| {
+        let image = egui::Image::new(egui::load::SizedTexture::new(icon.id(), size))
+            .bg_fill(egui::Color32::from_gray(240))
+            .rounding(egui::Rounding::same(4.0));
+        ui.add(image);
+        ui.radio_value(tool, value, label);
+    });
+}
+
+fn load_svg_icon(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureHandle {
+    let size = 32;
+    let image = rasterize_svg(bytes, size).unwrap_or_else(|| {
+        egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0])
+    });
+    ctx.load_texture(
+        format!("tool_icon_{}", name),
+        image,
+        egui::TextureOptions::LINEAR,
+    )
+}
+
+fn rasterize_svg(bytes: &[u8], size: u32) -> Option<egui::ColorImage> {
+    let opt = usvg::Options::default();
+    let tree = usvg::Tree::from_data(bytes, &opt).ok()?;
+    let svg_size = tree.size().to_int_size();
+    let scale_x = size as f32 / svg_size.width() as f32;
+    let scale_y = size as f32 / svg_size.height() as f32;
+    let transform = tiny_skia::Transform::from_scale(scale_x, scale_y);
+    let mut pixmap = tiny_skia::Pixmap::new(size, size)?;
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Some(egui::ColorImage::from_rgba_premultiplied(
+        [size as usize, size as usize],
+        pixmap.data(),
+    ))
 }
 
 fn canvas_to_image(pos: egui::Pos2, origin: egui::Pos2, scale: f32) -> egui::Pos2 {
@@ -1303,6 +1480,17 @@ fn fill_image(image: &mut image::RgbaImage, color: egui::Color32) {
     for y in 0..image.height() {
         for x in 0..image.width() {
             image.put_pixel(x, y, pixel);
+        }
+    }
+}
+
+fn copy_image_region(source: &image::RgbaImage, target: &mut image::RgbaImage) {
+    let width = source.width().min(target.width());
+    let height = source.height().min(target.height());
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = *source.get_pixel(x, y);
+            target.put_pixel(x, y, pixel);
         }
     }
 }
