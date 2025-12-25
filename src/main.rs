@@ -42,9 +42,10 @@ struct PreviewKey {
 
 struct Canvas {
     image: image::RgbaImage,
-    size: egui::Vec2,
     origin: egui::Pos2,
     scale: f32,
+    view_offset: egui::Vec2,
+    viewport_size: egui::Vec2,
     tiles: Vec<Tile>,
     tiles_per_row: u32,
 }
@@ -157,36 +158,48 @@ impl Canvas {
         let (tiles, tiles_per_row) = build_tiles(width, height);
         Self {
             image,
-            size,
             origin: egui::pos2(0.0, 0.0),
             scale,
+            view_offset: egui::Vec2::ZERO,
+            viewport_size: size,
             tiles,
             tiles_per_row,
         }
     }
 
-    fn update_layout(
-        &mut self,
-        size: egui::Vec2,
-        origin: egui::Pos2,
-        scale: f32,
-        background: egui::Color32,
-    ) {
-        let size_changed = (self.size - size).length() > 0.5;
-        let scale_changed = (self.scale - scale).abs() > f32::EPSILON;
-        if size_changed || scale_changed {
-            let (width, height) = canvas_pixel_size(size, scale);
-            let mut new_image = image::RgbaImage::new(width, height);
-            fill_image(&mut new_image, background);
-            copy_image(&self.image, &mut new_image);
-            self.image = new_image;
-            self.size = size;
-            self.scale = scale;
-            let (tiles, tiles_per_row) = build_tiles(width, height);
-            self.tiles = tiles;
-            self.tiles_per_row = tiles_per_row;
-        }
-        self.origin = origin;
+    fn update_layout(&mut self, viewport_size: egui::Vec2, viewport_min: egui::Pos2, scale: f32) {
+        self.viewport_size = viewport_size;
+        self.scale = scale;
+        self.clamp_view_offset();
+        self.origin = egui::pos2(
+            viewport_min.x - self.view_offset.x / self.scale,
+            viewport_min.y - self.view_offset.y / self.scale,
+        );
+    }
+
+    fn set_image(&mut self, image: image::RgbaImage) {
+        self.image = image;
+        let (tiles, tiles_per_row) = build_tiles(self.image.width(), self.image.height());
+        self.tiles = tiles;
+        self.tiles_per_row = tiles_per_row;
+        self.view_offset = egui::Vec2::ZERO;
+        self.clamp_view_offset();
+        self.mark_all_dirty();
+    }
+
+    fn scroll_by(&mut self, delta: egui::Vec2) {
+        self.view_offset.x = (self.view_offset.x - delta.x * self.scale).max(0.0);
+        self.view_offset.y = (self.view_offset.y - delta.y * self.scale).max(0.0);
+        self.clamp_view_offset();
+    }
+
+    fn clamp_view_offset(&mut self) {
+        let max_x =
+            (self.image.width() as f32 - self.viewport_size.x * self.scale).max(0.0);
+        let max_y =
+            (self.image.height() as f32 - self.viewport_size.y * self.scale).max(0.0);
+        self.view_offset.x = self.view_offset.x.clamp(0.0, max_x);
+        self.view_offset.y = self.view_offset.y.clamp(0.0, max_y);
     }
 
     fn clear(&mut self, background: egui::Color32) {
@@ -485,6 +498,21 @@ impl eframe::App for PaintApp {
                     }
                 }
 
+                if ui.button("Open PNG").clicked() {
+                    let dialog = rfd::FileDialog::new().add_filter("Image", &["png"]);
+                    if let Some(path) = dialog.pick_file() {
+                        match image::open(&path) {
+                            Ok(img) => {
+                                self.canvas.set_image(img.to_rgba8());
+                                self.status = Some(format!("Opened {}", path.display()));
+                            }
+                            Err(err) => {
+                                self.status = Some(format!("Open failed: {}", err));
+                            }
+                        }
+                    }
+                }
+
                 if let Some(status) = &self.status {
                     ui.add_space(8.0);
                     ui.label(status);
@@ -497,7 +525,16 @@ impl eframe::App for PaintApp {
             let rect = response.rect;
 
             self.canvas
-                .update_layout(rect.size(), rect.min, pixels_per_point, self.background);
+                .update_layout(rect.size(), rect.min, pixels_per_point);
+
+            if response.hovered() {
+                let scroll_delta = ctx.input(|i| i.raw_scroll_delta);
+                if scroll_delta != egui::Vec2::ZERO {
+                    self.canvas.scroll_by(scroll_delta);
+                    self.canvas
+                        .update_layout(rect.size(), rect.min, pixels_per_point);
+                }
+            }
 
             self.canvas.ensure_tiles(ctx);
             for tile in &self.canvas.tiles {
@@ -1022,17 +1059,6 @@ fn fill_image(image: &mut image::RgbaImage, color: egui::Color32) {
     for y in 0..image.height() {
         for x in 0..image.width() {
             image.put_pixel(x, y, pixel);
-        }
-    }
-}
-
-fn copy_image(source: &image::RgbaImage, target: &mut image::RgbaImage) {
-    let width = source.width().min(target.width());
-    let height = source.height().min(target.height());
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = *source.get_pixel(x, y);
-            target.put_pixel(x, y, pixel);
         }
     }
 }
