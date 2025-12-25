@@ -23,6 +23,7 @@ struct PaintApp {
     text_preview: Option<TextPreview>,
     text_caret: usize,
     text_selection: Option<usize>,
+    next_layer_id: u32,
 }
 
 struct TextPreview {
@@ -41,13 +42,43 @@ struct PreviewKey {
 }
 
 struct Canvas {
-    image: image::RgbaImage,
+    composite: image::RgbaImage,
+    layers: Vec<Layer>,
+    active_layer: usize,
     origin: egui::Pos2,
     scale: f32,
     view_offset: egui::Vec2,
     viewport_size: egui::Vec2,
+    composite_dirty: Option<DirtyRect>,
     tiles: Vec<Tile>,
     tiles_per_row: u32,
+}
+
+struct Layer {
+    name: String,
+    image: image::RgbaImage,
+    visible: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DirtyRect {
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+}
+
+impl Layer {
+    fn new(name: &str, width: u32, height: u32) -> Self {
+        let mut image = image::RgbaImage::new(width, height);
+        let transparent = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0);
+        fill_image(&mut image, transparent);
+        Self {
+            name: name.to_string(),
+            image,
+            visible: true,
+        }
+    }
 }
 
 struct Tile {
@@ -126,6 +157,7 @@ impl PaintApp {
             text_preview: None,
             text_caret: 0,
             text_selection: None,
+            next_layer_id: 2,
         }
     }
 
@@ -134,7 +166,7 @@ impl PaintApp {
             Tool::Brush | Tool::Line | Tool::Rectangle | Tool::Table | Tool::Ellipse => {
                 self.brush_color
             }
-            Tool::Eraser => self.background,
+            Tool::Eraser => egui::Color32::TRANSPARENT,
             Tool::Bucket | Tool::Text => self.brush_color,
         }
     }
@@ -153,15 +185,24 @@ impl PaintApp {
 impl Canvas {
     fn new(background: egui::Color32, size: egui::Vec2, scale: f32) -> Self {
         let (width, height) = canvas_pixel_size(size, scale);
-        let mut image = image::RgbaImage::new(width, height);
-        fill_image(&mut image, background);
-        let (tiles, tiles_per_row) = build_tiles(width, height);
+        let mut composite = image::RgbaImage::new(width, height);
+        fill_image(&mut composite, background);
+        let layers = vec![Layer::new("Layer 1", width, height)];
+        let (tiles, tiles_per_row) = build_tiles(composite.width(), composite.height());
         Self {
-            image,
+            composite,
+            layers,
+            active_layer: 0,
             origin: egui::pos2(0.0, 0.0),
             scale,
             view_offset: egui::Vec2::ZERO,
             viewport_size: size,
+            composite_dirty: Some(DirtyRect {
+                min_x: 0,
+                min_y: 0,
+                max_x: width as i32 - 1,
+                max_y: height as i32 - 1,
+            }),
             tiles,
             tiles_per_row,
         }
@@ -177,14 +218,69 @@ impl Canvas {
         );
     }
 
-    fn set_image(&mut self, image: image::RgbaImage) {
-        self.image = image;
-        let (tiles, tiles_per_row) = build_tiles(self.image.width(), self.image.height());
+    fn set_layers_from_image(&mut self, image: image::RgbaImage, name: String) {
+        let width = image.width();
+        let height = image.height();
+        self.layers = vec![Layer {
+            name,
+            image,
+            visible: true,
+        }];
+        self.active_layer = 0;
+        self.composite = image::RgbaImage::new(width, height);
+        let (tiles, tiles_per_row) = build_tiles(width, height);
         self.tiles = tiles;
         self.tiles_per_row = tiles_per_row;
         self.view_offset = egui::Vec2::ZERO;
         self.clamp_view_offset();
-        self.mark_all_dirty();
+        self.mark_composite_dirty_all();
+    }
+
+    fn ensure_composite(&mut self, background: egui::Color32) {
+        let Some(rect) = self.composite_dirty.take() else {
+            return;
+        };
+        let width = self.composite.width() as i32;
+        let height = self.composite.height() as i32;
+        let min_x = rect.min_x.clamp(0, width.saturating_sub(1));
+        let min_y = rect.min_y.clamp(0, height.saturating_sub(1));
+        let max_x = rect.max_x.clamp(0, width.saturating_sub(1));
+        let max_y = rect.max_y.clamp(0, height.saturating_sub(1));
+
+        if max_x < min_x || max_y < min_y {
+            return;
+        }
+
+        let pixel = image::Rgba(color_to_array(background));
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                self.composite.put_pixel(x as u32, y as u32, pixel);
+            }
+        }
+        for layer in &self.layers {
+            if !layer.visible {
+                continue;
+            }
+            let layer_width = layer.image.width() as i32;
+            let layer_height = layer.image.height() as i32;
+            let lx0 = min_x.clamp(0, layer_width.saturating_sub(1));
+            let ly0 = min_y.clamp(0, layer_height.saturating_sub(1));
+            let lx1 = max_x.clamp(0, layer_width.saturating_sub(1));
+            let ly1 = max_y.clamp(0, layer_height.saturating_sub(1));
+            if lx1 < lx0 || ly1 < ly0 {
+                continue;
+            }
+            for y in ly0..=ly1 {
+                for x in lx0..=lx1 {
+                    let src = *layer.image.get_pixel(x as u32, y as u32);
+                    let alpha = src.0[3];
+                    if alpha == 0 {
+                        continue;
+                    }
+                    blend_pixel_rgba(&mut self.composite, x as u32, y as u32, src, alpha);
+                }
+            }
+        }
     }
 
     fn scroll_by(&mut self, delta: egui::Vec2) {
@@ -195,24 +291,19 @@ impl Canvas {
 
     fn clamp_view_offset(&mut self) {
         let max_x =
-            (self.image.width() as f32 - self.viewport_size.x * self.scale).max(0.0);
+            (self.composite.width() as f32 - self.viewport_size.x * self.scale).max(0.0);
         let max_y =
-            (self.image.height() as f32 - self.viewport_size.y * self.scale).max(0.0);
+            (self.composite.height() as f32 - self.viewport_size.y * self.scale).max(0.0);
         self.view_offset.x = self.view_offset.x.clamp(0.0, max_x);
         self.view_offset.y = self.view_offset.y.clamp(0.0, max_y);
     }
 
-    fn clear(&mut self, background: egui::Color32) {
-        fill_image(&mut self.image, background);
-        for tile in &mut self.tiles {
-            tile.dirty = true;
+    fn clear(&mut self, _background: egui::Color32) {
+        let transparent = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0);
+        for layer in &mut self.layers {
+            fill_image(&mut layer.image, transparent);
         }
-    }
-
-    fn mark_all_dirty(&mut self) {
-        for tile in &mut self.tiles {
-            tile.dirty = true;
-        }
+        self.mark_composite_dirty_all();
     }
 
     fn ensure_tiles(&mut self, ctx: &egui::Context) {
@@ -220,7 +311,7 @@ impl Canvas {
             if !tile.dirty && tile.texture.is_some() {
                 continue;
             }
-            let color_image = tile_color_image(&self.image, tile.rect);
+            let color_image = tile_color_image(&self.composite, tile.rect);
             match &mut tile.texture {
                 Some(texture) => {
                     texture.set(color_image, egui::TextureOptions::NEAREST);
@@ -241,12 +332,19 @@ impl Canvas {
     fn mark_dirty_rect(&mut self, min: egui::Pos2, max: egui::Pos2) {
         let min_x = min.x.floor().max(0.0) as i32;
         let min_y = min.y.floor().max(0.0) as i32;
-        let max_x = max.x.ceil().min(self.image.width() as f32 - 1.0) as i32;
-        let max_y = max.y.ceil().min(self.image.height() as f32 - 1.0) as i32;
+        let max_x = max.x.ceil().min(self.composite.width() as f32 - 1.0) as i32;
+        let max_y = max.y.ceil().min(self.composite.height() as f32 - 1.0) as i32;
 
         if max_x < min_x || max_y < min_y {
             return;
         }
+
+        self.mark_composite_dirty(DirtyRect {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        });
 
         let min_tx = (min_x as u32) / TILE_SIZE;
         let max_tx = (max_x as u32) / TILE_SIZE;
@@ -261,6 +359,42 @@ impl Canvas {
                 }
             }
         }
+    }
+
+    fn mark_composite_dirty(&mut self, rect: DirtyRect) {
+        match &mut self.composite_dirty {
+            Some(existing) => {
+                existing.min_x = existing.min_x.min(rect.min_x);
+                existing.min_y = existing.min_y.min(rect.min_y);
+                existing.max_x = existing.max_x.max(rect.max_x);
+                existing.max_y = existing.max_y.max(rect.max_y);
+            }
+            None => {
+                self.composite_dirty = Some(rect);
+            }
+        }
+    }
+
+    fn mark_composite_dirty_all(&mut self) {
+        let width = self.composite.width() as i32;
+        let height = self.composite.height() as i32;
+        if width == 0 || height == 0 {
+            self.composite_dirty = None;
+            return;
+        }
+        self.composite_dirty = Some(DirtyRect {
+            min_x: 0,
+            min_y: 0,
+            max_x: width - 1,
+            max_y: height - 1,
+        });
+        for tile in &mut self.tiles {
+            tile.dirty = true;
+        }
+    }
+
+    fn active_layer_mut(&mut self) -> Option<&mut Layer> {
+        self.layers.get_mut(self.active_layer)
     }
 }
 
@@ -465,11 +599,14 @@ impl eframe::App for PaintApp {
 
                 ui.add_space(8.0);
                 ui.label("Background");
-                egui::color_picker::color_edit_button_srgba(
+                let background_response = egui::color_picker::color_edit_button_srgba(
                     ui,
                     &mut self.background,
                     egui::color_picker::Alpha::Opaque,
                 );
+                if background_response.changed() {
+                    self.canvas.mark_composite_dirty_all();
+                }
 
                 ui.add_space(8.0);
                 ui.label("Brush size");
@@ -479,6 +616,78 @@ impl eframe::App for PaintApp {
                 ui.label("Table");
                 ui.add(egui::Slider::new(&mut self.table_rows, 1..=12).text("Rows"));
                 ui.add(egui::Slider::new(&mut self.table_cols, 1..=12).text("Cols"));
+
+                ui.add_space(8.0);
+                ui.label("Layers");
+                let mut new_active = self.canvas.active_layer;
+                let mut layers_changed = false;
+                let active_layer = self.canvas.active_layer;
+                for (index, layer) in self.canvas.layers.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mut visible = layer.visible;
+                        if ui.checkbox(&mut visible, "").clicked() {
+                            layer.visible = visible;
+                            layers_changed = true;
+                        }
+                        if ui
+                            .selectable_label(index == active_layer, &layer.name)
+                            .clicked()
+                        {
+                            new_active = index;
+                        }
+                    });
+                }
+                self.canvas.active_layer = new_active.min(self.canvas.layers.len().saturating_sub(1));
+                if layers_changed {
+                    self.canvas.mark_composite_dirty_all();
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Add").clicked() {
+                        let name = format!("Layer {}", self.next_layer_id);
+                        self.next_layer_id += 1;
+                        let width = self.canvas.composite.width();
+                        let height = self.canvas.composite.height();
+                        self.canvas.layers.push(Layer::new(&name, width, height));
+                        self.canvas.active_layer = self.canvas.layers.len() - 1;
+                        self.canvas.mark_composite_dirty_all();
+                    }
+
+                    let can_delete = self.canvas.layers.len() > 1;
+                    if ui
+                        .add_enabled(can_delete, egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        self.canvas.layers.remove(self.canvas.active_layer);
+                        if self.canvas.active_layer >= self.canvas.layers.len() {
+                            self.canvas.active_layer = self.canvas.layers.len().saturating_sub(1);
+                        }
+                        self.canvas.mark_composite_dirty_all();
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    let can_up = self.canvas.active_layer > 0;
+                    if ui
+                        .add_enabled(can_up, egui::Button::new("Up"))
+                        .clicked()
+                    {
+                        let idx = self.canvas.active_layer;
+                        self.canvas.layers.swap(idx, idx - 1);
+                        self.canvas.active_layer -= 1;
+                        self.canvas.mark_composite_dirty_all();
+                    }
+                    let can_down = self.canvas.active_layer + 1 < self.canvas.layers.len();
+                    if ui
+                        .add_enabled(can_down, egui::Button::new("Down"))
+                        .clicked()
+                    {
+                        let idx = self.canvas.active_layer;
+                        self.canvas.layers.swap(idx, idx + 1);
+                        self.canvas.active_layer += 1;
+                        self.canvas.mark_composite_dirty_all();
+                    }
+                });
 
                 ui.add_space(8.0);
                 if ui.button("Clear").clicked() {
@@ -491,7 +700,8 @@ impl eframe::App for PaintApp {
                         .add_filter("Image", &["png"])
                         .set_file_name("painting.png");
                     if let Some(path) = dialog.save_file() {
-                        match self.canvas.image.save(&path) {
+                        self.canvas.ensure_composite(self.background);
+                        match self.canvas.composite.save(&path) {
                             Ok(()) => self.status = Some(format!("Saved to {}", path.display())),
                             Err(err) => self.status = Some(format!("Save failed: {}", err)),
                         }
@@ -503,7 +713,12 @@ impl eframe::App for PaintApp {
                     if let Some(path) = dialog.pick_file() {
                         match image::open(&path) {
                             Ok(img) => {
-                                self.canvas.set_image(img.to_rgba8());
+                                self.canvas.set_layers_from_image(
+                                    img.to_rgba8(),
+                                    "Image".to_string(),
+                                );
+                                self.next_layer_id = 2;
+                                self.canvas.mark_composite_dirty_all();
                                 self.status = Some(format!("Opened {}", path.display()));
                             }
                             Err(err) => {
@@ -536,6 +751,7 @@ impl eframe::App for PaintApp {
                 }
             }
 
+            self.canvas.ensure_composite(self.background);
             self.canvas.ensure_tiles(ctx);
             for tile in &self.canvas.tiles {
                 let Some(texture) = &tile.texture else {
@@ -566,16 +782,20 @@ impl eframe::App for PaintApp {
             }
 
             if commit_text && !self.text_buffer.is_empty() {
-                let text_px = 16.0 * self.text_scale as f32 * self.canvas.scale.max(1.0);
+                let scale = self.canvas.scale;
+                let origin = self.canvas.origin;
+                let text_px = 16.0 * self.text_scale as f32 * scale.max(1.0);
                 let color = image::Rgba(color_to_array(self.brush_color));
-                if let Some((min, max)) = self.text_renderer.draw_text(
-                    &mut self.canvas.image,
-                    &self.text_buffer,
-                    canvas_to_image(self.text_pos, self.canvas.origin, self.canvas.scale),
-                    text_px,
-                    color,
-                ) {
-                    self.canvas.mark_dirty_rect(min, max);
+                if let Some(layer) = self.canvas.active_layer_mut() {
+                    if let Some((min, max)) = self.text_renderer.draw_text(
+                        &mut layer.image,
+                        &self.text_buffer,
+                        canvas_to_image(self.text_pos, origin, scale),
+                        text_px,
+                        color,
+                    ) {
+                        self.canvas.mark_dirty_rect(min, max);
+                    }
                 }
                 self.text_buffer.clear();
                 self.text_active = false;
@@ -603,21 +823,24 @@ impl eframe::App for PaintApp {
                         }
                         if matches!(self.tool, Tool::Text) {
                             if self.text_active && !self.text_buffer.is_empty() {
-                                let text_px = 16.0 * self.text_scale as f32
-                                    * self.canvas.scale.max(1.0);
+                                let scale = self.canvas.scale;
+                                let origin = self.canvas.origin;
+                                let text_px = 16.0 * self.text_scale as f32 * scale.max(1.0);
                                 let color = image::Rgba(color_to_array(self.brush_color));
-                                if let Some((min, max)) = self.text_renderer.draw_text(
-                                    &mut self.canvas.image,
-                                    &self.text_buffer,
-                                    canvas_to_image(
-                                        self.text_pos,
-                                        self.canvas.origin,
-                                        self.canvas.scale,
-                                    ),
-                                    text_px,
-                                    color,
-                                ) {
-                                    self.canvas.mark_dirty_rect(min, max);
+                                if let Some(layer) = self.canvas.active_layer_mut() {
+                                    if let Some((min, max)) = self.text_renderer.draw_text(
+                                        &mut layer.image,
+                                        &self.text_buffer,
+                                        canvas_to_image(
+                                            self.text_pos,
+                                            origin,
+                                            scale,
+                                        ),
+                                        text_px,
+                                        color,
+                                    ) {
+                                        self.canvas.mark_dirty_rect(min, max);
+                                    }
                                 }
                                 self.text_buffer.clear();
                             }
@@ -630,44 +853,50 @@ impl eframe::App for PaintApp {
                             self.last_draw_pos = None;
                         } else {
                             if matches!(self.tool, Tool::Brush | Tool::Eraser) {
+                                let scale = self.canvas.scale;
+                                let origin = self.canvas.origin;
                                 let color = image::Rgba(color_to_array(self.current_color()));
-                                let canvas_pos =
-                                    canvas_to_image(pos, self.canvas.origin, self.canvas.scale);
-                                draw_filled_circle(
-                                    &mut self.canvas.image,
-                                    canvas_pos,
-                                    (self.brush_size / 2.0).max(1.0) * self.canvas.scale,
-                                    color,
-                                );
-                                let radius =
-                                    (self.brush_size / 2.0).max(1.0) * self.canvas.scale;
-                                self.canvas.mark_dirty_rect(
-                                    egui::pos2(canvas_pos.x - radius, canvas_pos.y - radius),
-                                    egui::pos2(canvas_pos.x + radius, canvas_pos.y + radius),
-                                );
-                                self.last_draw_pos = Some(canvas_pos);
+                                let canvas_pos = canvas_to_image(pos, origin, scale);
+                                let radius = (self.brush_size / 2.0).max(1.0) * scale;
+                                if let Some(layer) = self.canvas.active_layer_mut() {
+                                    draw_filled_circle(
+                                        &mut layer.image,
+                                        canvas_pos,
+                                        radius,
+                                        color,
+                                    );
+                                    self.canvas.mark_dirty_rect(
+                                        egui::pos2(canvas_pos.x - radius, canvas_pos.y - radius),
+                                        egui::pos2(canvas_pos.x + radius, canvas_pos.y + radius),
+                                    );
+                                    self.last_draw_pos = Some(canvas_pos);
+                                }
                             }
                             if matches!(self.tool, Tool::Bucket) {
-                                let canvas_pos =
-                                    canvas_to_image(pos, self.canvas.origin, self.canvas.scale);
+                                let scale = self.canvas.scale;
+                                let origin = self.canvas.origin;
+                                let canvas_pos = canvas_to_image(pos, origin, scale);
                                 let x = canvas_pos.x.round() as i32;
                                 let y = canvas_pos.y.round() as i32;
-                                if x >= 0
-                                    && y >= 0
-                                    && x < self.canvas.image.width() as i32
-                                    && y < self.canvas.image.height() as i32
-                                {
-                                    let target = *self.canvas.image.get_pixel(x as u32, y as u32);
-                                    let replacement =
-                                        image::Rgba(color_to_array(self.current_color()));
-                                    if target != replacement {
-                                        flood_fill(
-                                            &mut self.canvas.image,
-                                            egui::pos2(x as f32, y as f32),
-                                            target,
-                                            replacement,
-                                        );
-                                        self.canvas.mark_all_dirty();
+                                let replacement =
+                                    image::Rgba(color_to_array(self.current_color()));
+                                if let Some(layer) = self.canvas.active_layer_mut() {
+                                    if x >= 0
+                                        && y >= 0
+                                        && x < layer.image.width() as i32
+                                        && y < layer.image.height() as i32
+                                    {
+                                        let target =
+                                            *layer.image.get_pixel(x as u32, y as u32);
+                                        if target != replacement {
+                                            flood_fill(
+                                                &mut layer.image,
+                                                egui::pos2(x as f32, y as f32),
+                                                target,
+                                                replacement,
+                                            );
+                                            self.canvas.mark_composite_dirty_all();
+                                        }
                                     }
                                 }
                             }
@@ -681,26 +910,29 @@ impl eframe::App for PaintApp {
                     if rect.contains(pos) {
                         self.drag_current = Some(pos);
                         if matches!(self.tool, Tool::Brush | Tool::Eraser) {
+                            let scale = self.canvas.scale;
+                            let origin = self.canvas.origin;
                             let color = image::Rgba(color_to_array(self.current_color()));
-                            let canvas_pos =
-                                canvas_to_image(pos, self.canvas.origin, self.canvas.scale);
+                            let canvas_pos = canvas_to_image(pos, origin, scale);
                             if let Some(prev) = self.last_draw_pos {
-                                draw_brush_segment(
-                                    &mut self.canvas.image,
-                                    prev,
-                                    canvas_pos,
-                                    (self.brush_size / 2.0).max(1.0) * self.canvas.scale,
-                                    color,
-                                );
-                                let radius = (self.brush_size / 2.0).max(1.0) * self.canvas.scale;
-                                let min_x = prev.x.min(canvas_pos.x) - radius;
-                                let min_y = prev.y.min(canvas_pos.y) - radius;
-                                let max_x = prev.x.max(canvas_pos.x) + radius;
-                                let max_y = prev.y.max(canvas_pos.y) + radius;
-                                self.canvas.mark_dirty_rect(
-                                    egui::pos2(min_x, min_y),
-                                    egui::pos2(max_x, max_y),
-                                );
+                                if let Some(layer) = self.canvas.active_layer_mut() {
+                                    draw_brush_segment(
+                                        &mut layer.image,
+                                        prev,
+                                        canvas_pos,
+                                        (self.brush_size / 2.0).max(1.0) * scale,
+                                        color,
+                                    );
+                                    let radius = (self.brush_size / 2.0).max(1.0) * scale;
+                                    let min_x = prev.x.min(canvas_pos.x) - radius;
+                                    let min_y = prev.y.min(canvas_pos.y) - radius;
+                                    let max_x = prev.x.max(canvas_pos.x) + radius;
+                                    let max_y = prev.y.max(canvas_pos.y) + radius;
+                                    self.canvas.mark_dirty_rect(
+                                        egui::pos2(min_x, min_y),
+                                        egui::pos2(max_x, max_y),
+                                    );
+                                }
                             }
                             self.last_draw_pos = Some(canvas_pos);
                         }
@@ -710,90 +942,102 @@ impl eframe::App for PaintApp {
 
             if response.drag_stopped() {
                 if let (Some(start), Some(end)) = (self.drag_start, self.drag_current) {
+                    let origin = self.canvas.origin;
+                    let scale = self.canvas.scale;
                     let color = image::Rgba(color_to_array(self.current_color()));
-                    let radius = (self.brush_size / 2.0).max(1.0) * self.canvas.scale;
+                    let radius = (self.brush_size / 2.0).max(1.0) * scale;
                     match self.tool {
                         Tool::Line => {
-                            draw_line(
-                                &mut self.canvas.image,
-                                canvas_to_image(start, self.canvas.origin, self.canvas.scale),
-                                canvas_to_image(end, self.canvas.origin, self.canvas.scale),
-                                radius,
-                                color,
-                            );
-                            let start =
-                                canvas_to_image(start, self.canvas.origin, self.canvas.scale);
-                            let end = canvas_to_image(end, self.canvas.origin, self.canvas.scale);
-                            let min_x = start.x.min(end.x) - radius;
-                            let min_y = start.y.min(end.y) - radius;
-                            let max_x = start.x.max(end.x) + radius;
-                            let max_y = start.y.max(end.y) + radius;
-                            self.canvas.mark_dirty_rect(
-                                egui::pos2(min_x, min_y),
-                                egui::pos2(max_x, max_y),
-                            );
+                            if let Some(layer) = self.canvas.active_layer_mut() {
+                                draw_line(
+                                    &mut layer.image,
+                                    canvas_to_image(start, origin, scale),
+                                    canvas_to_image(end, origin, scale),
+                                    radius,
+                                    color,
+                                );
+                                let start = canvas_to_image(start, origin, scale);
+                                let end = canvas_to_image(end, origin, scale);
+                                let min_x = start.x.min(end.x) - radius;
+                                let min_y = start.y.min(end.y) - radius;
+                                let max_x = start.x.max(end.x) + radius;
+                                let max_y = start.y.max(end.y) + radius;
+                                self.canvas.mark_dirty_rect(
+                                    egui::pos2(min_x, min_y),
+                                    egui::pos2(max_x, max_y),
+                                );
+                            }
                         }
                         Tool::Rectangle => {
-                            let start =
-                                canvas_to_image(start, self.canvas.origin, self.canvas.scale);
-                            let end = canvas_to_image(end, self.canvas.origin, self.canvas.scale);
-                            let thickness = (self.brush_size * self.canvas.scale).round() as i32;
-                            draw_rect_outline(&mut self.canvas.image, start, end, thickness, color);
-                            let expand = thickness as f32;
-                            let min_x = start.x.min(end.x) - expand;
-                            let min_y = start.y.min(end.y) - expand;
-                            let max_x = start.x.max(end.x) + expand;
-                            let max_y = start.y.max(end.y) + expand;
-                            self.canvas.mark_dirty_rect(
-                                egui::pos2(min_x, min_y),
-                                egui::pos2(max_x, max_y),
-                            );
+                            if let Some(layer) = self.canvas.active_layer_mut() {
+                                let start = canvas_to_image(start, origin, scale);
+                                let end = canvas_to_image(end, origin, scale);
+                                let thickness = (self.brush_size * scale).round() as i32;
+                                draw_rect_outline(
+                                    &mut layer.image,
+                                    start,
+                                    end,
+                                    thickness,
+                                    color,
+                                );
+                                let expand = thickness as f32;
+                                let min_x = start.x.min(end.x) - expand;
+                                let min_y = start.y.min(end.y) - expand;
+                                let max_x = start.x.max(end.x) + expand;
+                                let max_y = start.y.max(end.y) + expand;
+                                self.canvas.mark_dirty_rect(
+                                    egui::pos2(min_x, min_y),
+                                    egui::pos2(max_x, max_y),
+                                );
+                            }
                         }
                         Tool::Table => {
-                            let start =
-                                canvas_to_image(start, self.canvas.origin, self.canvas.scale);
-                            let end = canvas_to_image(end, self.canvas.origin, self.canvas.scale);
-                            let thickness = (self.brush_size * self.canvas.scale).round() as i32;
-                            draw_table(
-                                &mut self.canvas.image,
-                                start,
-                                end,
-                                self.table_rows.max(1),
-                                self.table_cols.max(1),
-                                thickness,
-                                color,
-                            );
-                            let expand = thickness as f32;
-                            let min_x = start.x.min(end.x) - expand;
-                            let min_y = start.y.min(end.y) - expand;
-                            let max_x = start.x.max(end.x) + expand;
-                            let max_y = start.y.max(end.y) + expand;
-                            self.canvas.mark_dirty_rect(
-                                egui::pos2(min_x, min_y),
-                                egui::pos2(max_x, max_y),
-                            );
+                            if let Some(layer) = self.canvas.active_layer_mut() {
+                                let start = canvas_to_image(start, origin, scale);
+                                let end = canvas_to_image(end, origin, scale);
+                                let thickness = (self.brush_size * scale).round() as i32;
+                                draw_table(
+                                    &mut layer.image,
+                                    start,
+                                    end,
+                                    self.table_rows.max(1),
+                                    self.table_cols.max(1),
+                                    thickness,
+                                    color,
+                                );
+                                let expand = thickness as f32;
+                                let min_x = start.x.min(end.x) - expand;
+                                let min_y = start.y.min(end.y) - expand;
+                                let max_x = start.x.max(end.x) + expand;
+                                let max_y = start.y.max(end.y) + expand;
+                                self.canvas.mark_dirty_rect(
+                                    egui::pos2(min_x, min_y),
+                                    egui::pos2(max_x, max_y),
+                                );
+                            }
                         }
                         Tool::Ellipse => {
-                            let start =
-                                canvas_to_image(start, self.canvas.origin, self.canvas.scale);
-                            let end = canvas_to_image(end, self.canvas.origin, self.canvas.scale);
-                            let thickness = (self.brush_size * self.canvas.scale).round() as i32;
-                            draw_ellipse_outline(
-                                &mut self.canvas.image,
-                                start,
-                                end,
-                                thickness,
-                                color,
-                            );
-                            let expand = thickness as f32;
-                            let min_x = start.x.min(end.x) - expand;
-                            let min_y = start.y.min(end.y) - expand;
-                            let max_x = start.x.max(end.x) + expand;
-                            let max_y = start.y.max(end.y) + expand;
-                            self.canvas.mark_dirty_rect(
-                                egui::pos2(min_x, min_y),
-                                egui::pos2(max_x, max_y),
-                            );
+                            if let Some(layer) = self.canvas.active_layer_mut() {
+                                let start = canvas_to_image(start, origin, scale);
+                                let end = canvas_to_image(end, origin, scale);
+                                let thickness = (self.brush_size * scale).round() as i32;
+                                draw_ellipse_outline(
+                                    &mut layer.image,
+                                    start,
+                                    end,
+                                    thickness,
+                                    color,
+                                );
+                                let expand = thickness as f32;
+                                let min_x = start.x.min(end.x) - expand;
+                                let min_y = start.y.min(end.y) - expand;
+                                let max_x = start.x.max(end.x) + expand;
+                                let max_y = start.y.max(end.y) + expand;
+                                self.canvas.mark_dirty_rect(
+                                    egui::pos2(min_x, min_y),
+                                    egui::pos2(max_x, max_y),
+                                );
+                            }
                         }
                         _ => {}
                     }
