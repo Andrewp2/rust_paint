@@ -7,8 +7,8 @@ edition = "2024"
 opt-level = 1
 
 [dependencies]
-eframe = "0.27"
-rfd = "0.14"
+eframe = "0.33"
+rfd = "0.17"
 image = "0.24"
 fontdb = "0.15"
 fontdue = "0.8"
