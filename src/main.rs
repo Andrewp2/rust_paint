@@ -1256,6 +1256,7 @@ impl eframe::App for PaintApp {
                         rect.expand(4.0),
                         0.0,
                         egui::Stroke::new(1.0, egui::Color32::LIGHT_GRAY),
+                        egui::StrokeKind::Middle,
                     );
 
                     let scale = self.canvas.scale.max(1.0);
@@ -1326,6 +1327,7 @@ impl eframe::App for PaintApp {
                         ),
                         0.0,
                         egui::Stroke::new(1.0, egui::Color32::LIGHT_GRAY),
+                        egui::StrokeKind::Middle,
                     );
                 }
             }
@@ -1370,7 +1372,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Rust Paint",
         options,
-        Box::new(|_cc| Box::new(PaintApp::new())),
+        Box::new(|_cc| Ok(Box::new(PaintApp::new()))),
     )
 }
 
@@ -1391,7 +1393,7 @@ fn tool_radio(
     ui.horizontal(|ui| {
         let image = egui::Image::new(egui::load::SizedTexture::new(icon.id(), size))
             .bg_fill(egui::Color32::from_gray(240))
-            .rounding(egui::Rounding::same(4.0));
+            .corner_radius(egui::CornerRadius::same(4));
         ui.add(image);
         ui.radio_value(tool, value, label);
     });
@@ -1770,7 +1772,7 @@ fn render_rect_aligned(
     let inset = stroke_width / 2.0;
     let rect = egui::Rect::from_two_pos(min_canvas, max_canvas)
         .shrink2(egui::vec2(inset, inset));
-    painter.rect_stroke(rect, 0.0, egui::Stroke::new(stroke_width, color));
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(stroke_width, color), egui::StrokeKind::Middle);
 }
 
 fn render_table(
@@ -1784,7 +1786,7 @@ fn render_table(
 ) {
     let rect = egui::Rect::from_two_pos(start, end);
     let stroke = egui::Stroke::new(width, color);
-    painter.rect_stroke(rect, 0.0, stroke);
+    painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Middle);
 
     let rows = rows.max(1);
     let cols = cols.max(1);
